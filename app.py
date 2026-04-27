@@ -4,7 +4,9 @@ app.py — Streamlit chat interface for the Nissan Insight RAG.
 Run with: streamlit run app.py
 """
 
-import os, time
+import os, time, json
+from datetime import datetime, timezone
+from pathlib import Path
 from dotenv import load_dotenv
 import streamlit as st
 import voyageai
@@ -20,10 +22,18 @@ GEMINI_KEY   = os.environ["GEMINI_API_KEY"]
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 
-MATCH_COUNT  = 12   # chunks retrieved per query
-GEMINI_MODEL = "gemini-2.5-flash"
+MATCH_COUNT  = 12
 
-# ── Clients (cached so they're reused across reruns) ───────────────────────────
+# Primary + fallback Gemini models with their daily request limits (free tier)
+PRIMARY_MODEL  = "gemini-3-flash-preview"
+PRIMARY_RPD    = 20
+FALLBACK_MODEL = "gemini-3.1-flash-lite-preview"
+FALLBACK_RPD   = 500
+
+USAGE_FILE = Path("data/usage.json")
+
+
+# ── Clients ────────────────────────────────────────────────────────────────────
 
 @st.cache_resource
 def get_clients():
@@ -35,11 +45,44 @@ def get_clients():
 voyage, gemini, supabase = get_clients()
 
 
+# ── Daily usage tracking ───────────────────────────────────────────────────────
+
+def _today_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def load_usage() -> dict:
+    """Return today's usage dict, resetting if the date has rolled over."""
+    today = _today_utc()
+    if USAGE_FILE.exists():
+        try:
+            data = json.loads(USAGE_FILE.read_text())
+            if data.get("date") == today:
+                return data
+        except Exception:
+            pass
+    return {"date": today, PRIMARY_MODEL: 0, FALLBACK_MODEL: 0}
+
+
+def save_usage(usage: dict) -> None:
+    USAGE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    USAGE_FILE.write_text(json.dumps(usage))
+
+
+def record_use(model: str) -> None:
+    usage = load_usage()
+    usage[model] = usage.get(model, 0) + 1
+    save_usage(usage)
+
+
+def remaining(model: str, limit: int) -> int:
+    return max(0, limit - load_usage().get(model, 0))
+
+
 # ── RAG helpers ────────────────────────────────────────────────────────────────
 
 def embed_query(text: str) -> list[float]:
-    result = voyage.embed([text], model="voyage-3", input_type="query")
-    return result.embeddings[0]
+    return voyage.embed([text], model="voyage-3", input_type="query").embeddings[0]
 
 
 def retrieve(query_vec: list[float]) -> list[dict]:
@@ -59,7 +102,7 @@ def build_prompt(question: str, chunks: list[dict], history: list[dict]) -> str:
     if history:
         history_text = "\n\nConversation so far:\n" + "\n".join(
             f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content']}"
-            for m in history[-6:]  # last 3 turns
+            for m in history[-6:]
         )
 
     return f"""You are an expert analyst on Nissan customer experience research.
@@ -75,26 +118,48 @@ Report excerpts:
 Question: {question}"""
 
 
-def ask(question: str, history: list[dict]) -> tuple[str, list[dict]]:
+def call_gemini(model: str, prompt: str) -> str:
+    """Call Gemini once with retry on transient errors. Raises on quota exhaustion."""
+    for attempt in range(4):
+        try:
+            response = gemini.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=genai_types.GenerateContentConfig(temperature=0.2),
+            )
+            return response.text
+        except genai_errors.ClientError as e:
+            # 429 = quota exhausted → don't retry, let caller fall back
+            if getattr(e, "status_code", None) == 429:
+                raise
+            if attempt == 3:
+                raise
+            time.sleep(5 * (attempt + 1))
+        except genai_errors.ServerError:
+            if attempt == 3:
+                raise
+            time.sleep(5 * (attempt + 1))
+    raise RuntimeError("Unreachable")
+
+
+def ask(question: str, history: list[dict]) -> tuple[str, list[dict], str]:
+    """Returns (answer, chunks, model_used)."""
     query_vec = embed_query(question)
     chunks    = retrieve(query_vec)
     prompt    = build_prompt(question, chunks, history)
 
-    for attempt in range(4):
-        try:
-            response = gemini.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt,
-                config=genai_types.GenerateContentConfig(temperature=0.2),
-            )
-            break
-        except (genai_errors.ServerError, genai_errors.ClientError) as e:
-            if attempt == 3:
-                raise
-            wait = 5 * (attempt + 1)
-            time.sleep(wait)
-    answer = response.text
-    return answer, chunks
+    # Try primary, fall back to lite on quota exhaustion
+    try:
+        answer = call_gemini(PRIMARY_MODEL, prompt)
+        record_use(PRIMARY_MODEL)
+        return answer, chunks, PRIMARY_MODEL
+    except genai_errors.ClientError as e:
+        if getattr(e, "status_code", None) != 429:
+            raise
+        # Primary quota exhausted — try fallback
+        answer = call_gemini(FALLBACK_MODEL, prompt)
+        record_use(FALLBACK_MODEL)
+        return answer, chunks, FALLBACK_MODEL
 
 
 # ── UI ─────────────────────────────────────────────────────────────────────────
@@ -105,7 +170,7 @@ st.set_page_config(
     layout="wide",
 )
 
-# ── Password gate ──────────────────────────────────────────────────────────────
+# Password gate
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 
 if "authenticated" not in st.session_state:
@@ -131,9 +196,28 @@ with st.sidebar:
     st.markdown(
         "**Reports:** 121 PDFs (June 2023 – Nov 2025)  \n"
         "**Chunks:** 3,298  \n"
-        "**Embeddings:** Voyage AI voyage-3  \n"
-        "**LLM:** Gemini 2.5 Flash  \n"
+        f"**LLM:** {PRIMARY_MODEL} → {FALLBACK_MODEL}  \n"
     )
+
+    st.divider()
+    st.markdown("**Daily quota** _(resets at midnight UTC)_")
+
+    primary_left  = remaining(PRIMARY_MODEL, PRIMARY_RPD)
+    fallback_left = remaining(FALLBACK_MODEL, FALLBACK_RPD)
+
+    p_pct = primary_left / PRIMARY_RPD
+    p_color = "🟢" if p_pct > 0.5 else "🟡" if p_pct > 0.2 else "🔴"
+    st.markdown(f"{p_color} **{PRIMARY_MODEL}**  \n{primary_left} / {PRIMARY_RPD} remaining")
+
+    f_pct = fallback_left / FALLBACK_RPD
+    f_color = "🟢" if f_pct > 0.5 else "🟡" if f_pct > 0.2 else "🔴"
+    st.markdown(f"{f_color} **{FALLBACK_MODEL}**  \n{fallback_left} / {FALLBACK_RPD} remaining")
+
+    if primary_left == 0 and fallback_left == 0:
+        st.error("Daily quota exhausted on both models. Resets at midnight UTC.")
+    elif primary_left == 0:
+        st.info(f"Primary model exhausted — using {FALLBACK_MODEL} until midnight UTC.")
+
     st.divider()
     if st.button("Clear conversation"):
         st.session_state.messages = []
@@ -153,20 +237,24 @@ for msg in st.session_state.messages:
 
 # Chat input
 if question := st.chat_input("Ask a question about the Nissan research reports…"):
-    # Show user message
     st.session_state.messages.append({"role": "user", "content": question})
     with st.chat_message("user"):
         st.markdown(question)
 
-    # Get answer
     with st.chat_message("assistant"):
         with st.spinner("Searching reports…"):
-            answer, chunks = ask(question, st.session_state.messages[:-1])
-            st.session_state.last_chunks = chunks
+            try:
+                answer, chunks, model_used = ask(question, st.session_state.messages[:-1])
+                st.session_state.last_chunks = chunks
+            except genai_errors.ClientError as e:
+                if getattr(e, "status_code", None) == 429:
+                    st.error("Both daily quotas are exhausted. Try again after midnight UTC.")
+                    st.stop()
+                raise
 
         st.markdown(answer)
+        st.caption(f"_Answered with **{model_used}**_")
 
-        # Citation cards
         if chunks:
             st.divider()
             st.caption("**Sources retrieved**")
