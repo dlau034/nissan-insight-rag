@@ -1,0 +1,8 @@
+pypdf==6.10.2
+tiktoken
+voyageai
+google-genai
+supabase==2.3.5
+python-dotenv
+tenacity
+streamlit
