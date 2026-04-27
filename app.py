@@ -22,7 +22,8 @@ GEMINI_KEY   = os.environ["GEMINI_API_KEY"]
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 
-MATCH_COUNT  = 12
+MATCH_COUNT  = 30   # retrieve more candidates for reranking
+RERANK_TOP_K = 12   # final top-k after Voyage rerank-2
 
 # Primary + fallback Gemini models with their daily request limits (free tier)
 PRIMARY_MODEL  = "gemini-3-flash-preview"
@@ -85,12 +86,20 @@ def embed_query(text: str) -> list[float]:
     return voyage.embed([text], model="voyage-3", input_type="query").embeddings[0]
 
 
-def retrieve(query_vec: list[float]) -> list[dict]:
+def retrieve(query_vec: list[float], query_text: str) -> list[dict]:
     resp = supabase.rpc(
-        "match_insights",
-        {"query_embedding": query_vec, "match_count": MATCH_COUNT},
+        "hybrid_match_insights",
+        {"query_embedding": query_vec, "query_text": query_text, "match_count": MATCH_COUNT},
     ).execute()
     return resp.data or []
+
+
+def rerank_chunks(question: str, chunks: list[dict]) -> list[dict]:
+    if not chunks:
+        return chunks
+    texts = [c["content"] for c in chunks]
+    result = voyage.rerank(query=question, documents=texts, model="rerank-2", top_k=RERANK_TOP_K)
+    return [chunks[r.index] for r in result.results]
 
 
 def build_prompt(question: str, chunks: list[dict], history: list[dict]) -> str:
@@ -105,11 +114,18 @@ def build_prompt(question: str, chunks: list[dict], history: list[dict]) -> str:
             for m in history[-6:]
         )
 
-    return f"""You are an expert analyst on Nissan customer experience research.
-Answer the question below using ONLY the provided report excerpts.
-Cite every claim with the excerpt number in square brackets e.g. [1] or [2][3].
-If the excerpts do not contain enough information to answer, say so clearly.
-Do not invent facts not present in the excerpts.
+    return f"""You are an expert analyst on Nissan customer experience research. Your role is to synthesise findings from internal CX research reports and present them clearly to a non-technical business audience.
+
+INSTRUCTIONS:
+1. Answer using ONLY the provided report excerpts. Do not invent or infer facts not present in them.
+2. Cite every claim with the excerpt number in square brackets, e.g. [1] or [2][3]. Never make an uncited claim.
+3. Structure your answer as:
+   - **TL;DR** (2–3 sentences maximum): the single most important finding.
+   - **Detail**: supporting points, grouped by theme, market, or brand where relevant.
+4. When excerpts cover multiple markets or Nissan/Infiniti brands, distinguish them explicitly (e.g. "In the UK… [2]", "For Infiniti… [5]").
+5. If excerpts contradict each other, flag the contradiction: "Reports differ: [3] states X while [7] states Y."
+6. Preserve quantitative data exactly as stated (percentages, scores, sample sizes). Do not round or paraphrase numbers.
+7. If the excerpts do not contain enough information to answer fully, state clearly what is and is not covered, and suggest what kind of report might contain the missing data.
 {history_text}
 
 Report excerpts:
@@ -145,7 +161,8 @@ def call_gemini(model: str, prompt: str) -> str:
 def ask(question: str, history: list[dict]) -> tuple[str, list[dict], str]:
     """Returns (answer, chunks, model_used)."""
     query_vec = embed_query(question)
-    chunks    = retrieve(query_vec)
+    chunks    = retrieve(query_vec, question)
+    chunks    = rerank_chunks(question, chunks)
     prompt    = build_prompt(question, chunks, history)
 
     # Try primary, fall back to lite on quota exhaustion
