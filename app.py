@@ -356,10 +356,9 @@ with st.sidebar:
     )
     st.divider()
     if st.button("Clear conversation"):
-        st.session_state.messages   = []
-        st.session_state.mode       = "Reports"
+        st.session_state.messages      = []
+        st.session_state.mode          = "Reports"
         st.session_state.pending_input = ""
-        st.session_state.chat_text  = ""
         st.rerun()
 
 # ── Session state defaults ───────────────────────────────────────────────────────
@@ -367,13 +366,7 @@ with st.sidebar:
 st.session_state.setdefault("messages",       [])
 st.session_state.setdefault("mode",           "Reports")
 st.session_state.setdefault("pending_input",  "")
-
-
-# ── Apply pending "copy to search" pre-fill ──────────────────────────────────────
-
-if st.session_state.pending_input:
-    st.session_state.chat_text    = st.session_state.pending_input
-    st.session_state.pending_input = ""
+st.session_state.setdefault("form_counter",   0)
 
 
 # ── Render chat history ──────────────────────────────────────────────────────────
@@ -398,25 +391,34 @@ for idx, msg in enumerate(st.session_state.messages):
 
 
 # ── Bottom bar ───────────────────────────────────────────────────────────────────
+# Use st.form so the input clears automatically on submit (clear_on_submit=True),
+# and pre-fill via value= so we never write to a widget key after it's rendered.
 
-col_input, col_mode, col_send = st.columns([6, 1, 1])
+mode_options = ["Reports", "Web"] if TAVILY_ENABLED else ["Reports"]
+pending      = st.session_state.get("pending_input", "")
+current_mode = st.session_state.get("mode", "Reports")
+mode_idx     = mode_options.index(current_mode) if current_mode in mode_options else 0
 
-with col_input:
-    chat_text = st.text_area(
-        "message",
-        key="chat_text",
-        label_visibility="collapsed",
-        placeholder="Ask a question about the Nissan research reports…",
-        height=80,
-    )
+with st.form(f"chat_form_{st.session_state.form_counter}", clear_on_submit=False):
+    col_input, col_mode, col_send = st.columns([6, 1, 1])
+    with col_input:
+        chat_text = st.text_area(
+            "message",
+            value=pending,
+            label_visibility="collapsed",
+            placeholder="Ask a question about the Nissan research reports…",
+            height=80,
+        )
+    with col_mode:
+        mode = st.selectbox(
+            "Mode", mode_options, index=mode_idx, label_visibility="collapsed"
+        )
+    with col_send:
+        st.markdown("<div style='margin-top:1.85rem'></div>", unsafe_allow_html=True)
+        send = st.form_submit_button("Send", use_container_width=True)
 
-with col_mode:
-    mode_options = ["Reports", "Web"] if TAVILY_ENABLED else ["Reports"]
-    mode = st.selectbox("Mode", mode_options, key="mode", label_visibility="collapsed")
-
-with col_send:
-    st.markdown("<div style='margin-top:1.85rem'></div>", unsafe_allow_html=True)
-    send = st.button("Send", use_container_width=True)
+# Consume the pending input now that the form has rendered it
+st.session_state.pending_input = ""
 
 if not TAVILY_ENABLED:
     st.caption("ℹ️ Add `TAVILY_API_KEY` to `.env` or Streamlit secrets to enable Web search.")
@@ -426,7 +428,8 @@ if not TAVILY_ENABLED:
 
 if send and chat_text and chat_text.strip():
     question = chat_text.strip()
-    st.session_state.chat_text = ""   # clear input for next render
+    st.session_state.mode = mode
+    st.session_state.form_counter += 1  # cycle form key → fresh empty form on next render
 
     if mode == "Web":
         st.session_state.messages.append({"role": "user", "kind": "user_web", "content": question})
