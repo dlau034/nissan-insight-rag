@@ -24,11 +24,19 @@ except ImportError:
 
 load_dotenv()
 
+def _setting(name: str, default: str = "") -> str:
+    try:
+        value = st.secrets.get(name, default)
+    except Exception:
+        value = default
+    return os.environ.get(name, value)
+
+
 VOYAGE_KEY   = os.environ["VOYAGE_API_KEY"]
 GEMINI_KEY   = os.environ["GEMINI_API_KEY"]
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
-TAVILY_KEY   = os.environ.get("TAVILY_API_KEY", "")
+TAVILY_KEY   = _setting("TAVILY_API_KEY")
 
 MATCH_COUNT          = 30   # hybrid retrieve candidates
 RERANK_TOP_K         = 12   # internal top-k after Voyage rerank-2
@@ -410,6 +418,8 @@ with st.sidebar:
         "**Reports:** 121 PDFs (June 2023 – Nov 2025)  \n"
         "**Chunks:** 3,298  \n"
     )
+    if not TAVILY_ENABLED:
+        st.caption("Web search is disabled until `TAVILY_API_KEY` is added to Streamlit secrets.")
     st.divider()
     if st.button("Clear conversation"):
         st.session_state.messages      = []
@@ -456,6 +466,7 @@ st.markdown("""
 :root {
     --sidebar-width: 200px;
     --composer-height: 88px;
+    --streamlit-cloud-cta-space: 10rem;
 }
 section[data-testid="stSidebar"] {
     width: var(--sidebar-width) !important;
@@ -493,7 +504,7 @@ div[data-testid="stForm"] {
     overflow: visible !important;
     box-sizing: border-box !important;
     background-color: white;
-    padding: 0.55rem 1rem 0.65rem;
+    padding: 0.55rem calc(1rem + var(--streamlit-cloud-cta-space)) 0.65rem 1rem;
     border-top: 1px solid rgba(49, 51, 63, 0.2);
     box-shadow: 0 -2px 8px rgba(0, 0, 0, 0.05);
 }
@@ -534,7 +545,7 @@ div[data-testid="stForm"] div[data-testid="stFormSubmitButton"] button p {
         max-width: none !important;
         max-height: 210px !important;
         padding-left: 1rem;
-        padding-right: 1rem;
+        padding-right: calc(1rem + var(--streamlit-cloud-cta-space));
     }
     div[data-testid="stForm"] div[data-testid="stHorizontalBlock"] {
         flex-direction: column !important;
@@ -580,10 +591,6 @@ with st.form(f"chat_form_{st.session_state.form_counter}", clear_on_submit=False
 
 # Consume the pending input now that the form has rendered it
 st.session_state.pending_input = ""
-
-if not TAVILY_ENABLED:
-    st.caption("ℹ️ Add `TAVILY_API_KEY` to `.env` or Streamlit secrets to enable Web search.")
-
 
 # ── Handle send ──────────────────────────────────────────────────────────────────
 
