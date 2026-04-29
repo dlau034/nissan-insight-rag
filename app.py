@@ -42,6 +42,9 @@ MATCH_COUNT          = 30   # hybrid retrieve candidates
 RERANK_TOP_K         = 12   # internal top-k after Voyage rerank-2
 WEB_K                = 8    # Tavily results per call
 WEB_RERANK_TOP_K     = 8    # web pool rerank top-k
+RESEARCH_POLL_SECONDS = 2
+RESEARCH_TIMEOUT_SECONDS = 120
+RESEARCH_MODEL = "mini"
 
 # Primary + fallback Gemini models
 PRIMARY_MODEL  = "gemini-3-flash-preview"
@@ -49,7 +52,8 @@ FALLBACK_MODEL = "gemini-3.1-flash-lite-preview"
 
 USAGE_FILE = Path("data/usage.json")
 REPORTS_MODE = "CE Reports"
-WEB_MODE = "Web"
+WEB_MODE = "Web Search"
+DEEP_RESEARCH_MODE = "Deep Research"
 APP_VERSION = "v1.1.0"
 
 
@@ -112,7 +116,9 @@ def _format_history(history: list[dict]) -> str:
     for m in history[-6:]:
         role = "User" if m["role"] == "user" else "Assistant"
         tag = " (web search)" if m.get("kind") == "user_web" else \
-              " (web answer)" if m.get("kind") == "assistant_web" else ""
+              " (web answer)" if m.get("kind") == "assistant_web" else \
+              " (deep research)" if m.get("kind") == "user_research" else \
+              " (deep research answer)" if m.get("kind") == "assistant_research" else ""
         lines.append(f"{role}{tag}: {m['content']}")
     return "\n\nConversation so far:\n" + "\n".join(lines)
 
@@ -307,6 +313,112 @@ def ask_web(query: str, history: list[dict]) -> tuple[str, list[dict], str]:
     return answer, web_chunks, model_used
 
 
+def _research_status(result: dict) -> str:
+    return str(result.get("status") or result.get("state") or "").lower()
+
+
+def _research_content(result: dict) -> str:
+    return result.get("content") or result.get("report") or result.get("answer") or ""
+
+
+def _research_sources(result: dict) -> list:
+    return result.get("sources") or result.get("results") or []
+
+
+def _normalize_research_sources(sources: list) -> list[dict]:
+    normalized = []
+    for i, source in enumerate(sources):
+        if isinstance(source, str):
+            url = source
+            title = _domain(source) or f"Source {i + 1}"
+            content = ""
+        elif isinstance(source, dict):
+            url = source.get("url") or source.get("source_url") or source.get("link") or ""
+            title = source.get("title") or source.get("name") or _domain(url) or f"Source {i + 1}"
+            content = source.get("content") or source.get("snippet") or source.get("summary") or ""
+        else:
+            continue
+        normalized.append(
+            {
+                "source_id": f"research:{url or i}",
+                "source_url": url,
+                "title": title,
+                "page": None,
+                "chunk_index": 0,
+                "content": content,
+                "similarity": None,
+                "is_external": True,
+                "is_research": True,
+            }
+        )
+    return normalized
+
+
+def ask_deep_research(query: str, status_box=None) -> tuple[str, list[dict], str, str | None]:
+    """Run Tavily Deep Research and return (report, sources, model_label, request_id)."""
+    model_label = "tavily-research-mini"
+    if not TAVILY_ENABLED:
+        return "Deep Research is not configured. Add TAVILY_API_KEY to enable it.", [], model_label, None
+
+    def _status(message: str) -> None:
+        if status_box is not None:
+            status_box.info(message)
+
+    try:
+        _status("Creating research task…")
+        task = tavily.research(
+            input=query,
+            model=RESEARCH_MODEL,
+            citation_format="numbered",
+        )
+        request_id = task.get("request_id") or task.get("id")
+
+        if not request_id:
+            content = _research_content(task)
+            if content:
+                _status("Finalizing report…")
+                return content, _normalize_research_sources(_research_sources(task)), model_label, None
+            return "Deep Research did not return a request ID or report content.", [], model_label, None
+
+        _status(f"Research task created… Request ID: {request_id}")
+        deadline = time.time() + RESEARCH_TIMEOUT_SECONDS
+        finalizing_statuses = {"finalizing", "synthesizing", "writing", "generating"}
+        complete_statuses = {"completed", "complete", "done", "success"}
+        failed_statuses = {"failed", "error", "cancelled", "canceled"}
+
+        while time.time() < deadline:
+            result = tavily.get_research(request_id)
+            status = _research_status(result)
+
+            if status in complete_statuses:
+                _status("Finalizing report…")
+                content = _research_content(result)
+                sources = _normalize_research_sources(_research_sources(result))
+                if not content:
+                    content = "Deep Research completed but returned no report content."
+                return content, sources, model_label, request_id
+
+            if status in failed_statuses:
+                message = result.get("error") or result.get("message") or "No error detail was returned."
+                return f"Deep Research failed for request `{request_id}`: {message}", [], model_label, request_id
+
+            if status in finalizing_statuses:
+                _status("Finalizing report…")
+            else:
+                _status("Research in progress…")
+            time.sleep(RESEARCH_POLL_SECONDS)
+
+        return (
+            f"Deep Research is still running after {RESEARCH_TIMEOUT_SECONDS} seconds. "
+            f"Request ID: `{request_id}`. Please try again shortly.",
+            [],
+            model_label,
+            request_id,
+        )
+    except Exception as e:
+        return f"Deep Research failed: {e}", [], model_label, None
+
+
 # ── UI helpers ───────────────────────────────────────────────────────────────────
 
 def _render_source_cards(chunks: list[dict], is_web: bool = False) -> None:
@@ -318,9 +430,12 @@ def _render_source_cards(chunks: list[dict], is_web: bool = False) -> None:
     for i, chunk in enumerate(chunks):
         with cols[i % 3]:
             if is_web:
-                domain = _domain(chunk["source_url"])
+                url = chunk.get("source_url", "")
+                domain = _domain(url) if url else "Source"
+                source_ref = f"[{i+1}]" if chunk.get("is_research") else f"[w{i+1}]"
+                source_link = f"[{domain}]({url})" if url else domain
                 st.markdown(
-                    f"**[w{i+1}]** [{domain}]({chunk['source_url']})  \n"
+                    f"**{source_ref}** {source_link}  \n"
                     f"_{chunk['title'][:55]}_"
                 )
             else:
@@ -333,10 +448,15 @@ def _render_source_cards(chunks: list[dict], is_web: bool = False) -> None:
                 )
 
 
-def _render_origin_label(is_web: bool) -> None:
-    label = "Generated from Web search" if is_web else "Generated from CE reports"
-    bg = "#111827" if is_web else "#F3F4F6"
-    fg = "#FFFFFF" if is_web else "#111827"
+def _render_origin_label(source_kind: str) -> None:
+    if source_kind == "research":
+        label = "Generated from Tavily Deep Research"
+    elif source_kind == "web":
+        label = "Generated from Web search"
+    else:
+        label = "Generated from CE reports"
+    bg = "#111827" if source_kind in {"web", "research"} else "#F3F4F6"
+    fg = "#FFFFFF" if source_kind in {"web", "research"} else "#111827"
     st.markdown(
         f"""
         <div style="margin: 0.15rem 0 0.65rem;">
@@ -382,7 +502,7 @@ def _render_followup_block(suggestion: str | None, btn_key: str) -> None:
             _prefill_chat(suggestion, WEB_MODE)
             st.rerun()
     else:
-        st.caption("**Extend with a web search** — switch to Web mode below and ask a follow-up.")
+        st.caption("**Extend with a web search** — switch to Web Search mode below and ask a follow-up.")
 
 
 # ── Page config & auth ───────────────────────────────────────────────────────────
@@ -445,17 +565,21 @@ for idx, msg in enumerate(st.session_state.messages):
 
     if msg["role"] == "user":
         with st.chat_message("user"):
-            prefix = "🌐 " if kind == "user_web" else ""
+            prefix = "🌐 " if kind == "user_web" else "Deep Research: " if kind == "user_research" else ""
             st.markdown(f"{prefix}{msg['content']}")
     else:
         with st.chat_message("assistant"):
             st.markdown(msg["content"])
-            _render_origin_label(is_web=(kind == "assistant_web"))
+            source_kind = "research" if kind == "assistant_research" else "web" if kind == "assistant_web" else "reports"
+            _render_origin_label(source_kind)
             model_label = msg.get("model", "")
-            web_label   = "  · Web sources" if kind == "assistant_web" else ""
+            source_label = "  · Web sources" if kind == "assistant_web" else \
+                           "  · Deep Research sources" if kind == "assistant_research" else ""
+            request_id = msg.get("request_id")
+            request_label = f"  · Request `{request_id}`" if request_id else ""
             if model_label:
-                st.caption(f"_Answered with **{model_label}**{web_label}_")
-            _render_source_cards(msg.get("chunks", []), is_web=(kind == "assistant_web"))
+                st.caption(f"_Answered with **{model_label}**{request_label}{source_label}_")
+            _render_source_cards(msg.get("chunks", []), is_web=(kind in {"assistant_web", "assistant_research"}))
             if kind == "assistant_internal":
                 _render_followup_block(msg.get("suggestion"), btn_key=f"cp_{idx}")
 
@@ -562,12 +686,15 @@ div[data-testid="stForm"] div[data-testid="stFormSubmitButton"] button p {
 </style>
 """, unsafe_allow_html=True)
 
-mode_options = [REPORTS_MODE, WEB_MODE] if TAVILY_ENABLED else [REPORTS_MODE]
+mode_options = [REPORTS_MODE, WEB_MODE, DEEP_RESEARCH_MODE] if TAVILY_ENABLED else [REPORTS_MODE]
 pending      = st.session_state.get("pending_input", "")
 current_mode = st.session_state.get("mode", REPORTS_MODE)
 if current_mode == "Reports":
     current_mode = REPORTS_MODE
     st.session_state.mode = REPORTS_MODE
+elif current_mode == "Web":
+    current_mode = WEB_MODE
+    st.session_state.mode = WEB_MODE
 mode_idx     = mode_options.index(current_mode) if current_mode in mode_options else 0
 
 with st.form(f"chat_form_{st.session_state.form_counter}", clear_on_submit=False):
@@ -602,7 +729,32 @@ if send and chat_text and chat_text.strip():
     st.session_state.mode = mode
     st.session_state.form_counter += 1  # cycle form key → fresh empty form on next render
 
-    if mode == WEB_MODE:
+    if mode == DEEP_RESEARCH_MODE:
+        st.session_state.messages.append({"role": "user", "kind": "user_research", "content": question})
+        with st.chat_message("user"):
+            st.markdown(f"Deep Research: {question}")
+
+        with st.chat_message("assistant"):
+            status_box = st.empty()
+            answer, research_chunks, model_used, request_id = ask_deep_research(
+                question, status_box=status_box
+            )
+            status_box.empty()
+            st.markdown(answer)
+            _render_origin_label("research")
+            request_label = f"  · Request `{request_id}`" if request_id else ""
+            st.caption(f"_Answered with **{model_used}**{request_label}  · Deep Research sources_")
+            _render_source_cards(research_chunks, is_web=True)
+
+        st.session_state.messages.append({
+            "role": "assistant", "kind": "assistant_research",
+            "content": answer, "model": model_used,
+            "chunks": research_chunks, "suggestion": None,
+            "request_id": request_id,
+        })
+        st.session_state.mode = REPORTS_MODE   # auto-revert
+
+    elif mode == WEB_MODE:
         st.session_state.messages.append({"role": "user", "kind": "user_web", "content": question})
         with st.chat_message("user"):
             st.markdown(f"🌐 {question}")
@@ -619,7 +771,7 @@ if send and chat_text and chat_text.strip():
                         st.stop()
                     raise
             st.markdown(answer)
-            _render_origin_label(is_web=True)
+            _render_origin_label("web")
             st.caption(f"_Answered with **{model_used}**  · Web sources_")
             _render_source_cards(web_chunks, is_web=True)
 
@@ -647,7 +799,7 @@ if send and chat_text and chat_text.strip():
                         st.stop()
                     raise
             st.markdown(answer)
-            _render_origin_label(is_web=False)
+            _render_origin_label("reports")
             st.caption(f"_Answered with **{model_used}**_")
             _render_source_cards(chunks, is_web=False)
             _render_followup_block(suggestion, btn_key=f"cp_new_{len(st.session_state.messages)}")
