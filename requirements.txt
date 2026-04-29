@@ -6,3 +6,4 @@ supabase>=2.7.0
 python-dotenv
 tenacity
 streamlit
+tavily-python

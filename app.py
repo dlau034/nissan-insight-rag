@@ -7,6 +7,7 @@ Run with: streamlit run app.py
 import os, time, json
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 from dotenv import load_dotenv
 import streamlit as st
 import voyageai
@@ -15,45 +16,52 @@ from google.genai import types as genai_types
 from google.genai import errors as genai_errors
 from supabase import create_client
 
+try:
+    from tavily import TavilyClient as _TavilyClient
+except ImportError:
+    _TavilyClient = None
+
 load_dotenv()
 
 VOYAGE_KEY   = os.environ["VOYAGE_API_KEY"]
 GEMINI_KEY   = os.environ["GEMINI_API_KEY"]
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
+TAVILY_KEY   = os.environ.get("TAVILY_API_KEY", "")
 
-MATCH_COUNT  = 30   # retrieve more candidates for reranking
-RERANK_TOP_K = 12   # final top-k after Voyage rerank-2
+MATCH_COUNT          = 30   # hybrid retrieve candidates
+RERANK_TOP_K         = 12   # internal top-k after Voyage rerank-2
+WEB_K                = 8    # Tavily results per call
+WEB_RERANK_TOP_K     = 8    # web pool rerank top-k
 
-# Primary + fallback Gemini models with their daily request limits (free tier)
+# Primary + fallback Gemini models
 PRIMARY_MODEL  = "gemini-3-flash-preview"
-PRIMARY_RPD    = 20
 FALLBACK_MODEL = "gemini-3.1-flash-lite-preview"
-FALLBACK_RPD   = 500
 
 USAGE_FILE = Path("data/usage.json")
 
 
-# ── Clients ────────────────────────────────────────────────────────────────────
+# ── Clients ─────────────────────────────────────────────────────────────────────
 
 @st.cache_resource
 def get_clients():
-    voyage   = voyageai.Client(api_key=VOYAGE_KEY)
-    gemini   = genai.Client(api_key=GEMINI_KEY)
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-    return voyage, gemini, supabase
+    v = voyageai.Client(api_key=VOYAGE_KEY)
+    g = genai.Client(api_key=GEMINI_KEY)
+    s = create_client(SUPABASE_URL, SUPABASE_KEY)
+    t = _TavilyClient(api_key=TAVILY_KEY) if (_TavilyClient and TAVILY_KEY) else None
+    return v, g, s, t
 
-voyage, gemini, supabase = get_clients()
+voyage, gemini, supabase, tavily = get_clients()
+TAVILY_ENABLED = tavily is not None
 
 
-# ── Daily usage tracking ───────────────────────────────────────────────────────
+# ── Daily usage tracking ─────────────────────────────────────────────────────────
 
 def _today_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
 def load_usage() -> dict:
-    """Return today's usage dict, resetting if the date has rolled over."""
     today = _today_utc()
     if USAGE_FILE.exists():
         try:
@@ -76,11 +84,28 @@ def record_use(model: str) -> None:
     save_usage(usage)
 
 
-def remaining(model: str, limit: int) -> int:
-    return max(0, limit - load_usage().get(model, 0))
+# ── Helpers ──────────────────────────────────────────────────────────────────────
+
+def _domain(url: str) -> str:
+    try:
+        return urlparse(url).netloc.replace("www.", "")
+    except Exception:
+        return url[:40]
 
 
-# ── RAG helpers ────────────────────────────────────────────────────────────────
+def _format_history(history: list[dict]) -> str:
+    if not history:
+        return ""
+    lines = []
+    for m in history[-6:]:
+        role = "User" if m["role"] == "user" else "Assistant"
+        tag = " (web search)" if m.get("kind") == "user_web" else \
+              " (web answer)" if m.get("kind") == "assistant_web" else ""
+        lines.append(f"{role}{tag}: {m['content']}")
+    return "\n\nConversation so far:\n" + "\n".join(lines)
+
+
+# ── RAG core ─────────────────────────────────────────────────────────────────────
 
 def embed_query(text: str) -> list[float]:
     return voyage.embed([text], model="voyage-3", input_type="query").embeddings[0]
@@ -94,48 +119,16 @@ def retrieve(query_vec: list[float], query_text: str) -> list[dict]:
     return resp.data or []
 
 
-def rerank_chunks(question: str, chunks: list[dict]) -> list[dict]:
+def rerank_chunks(question: str, chunks: list[dict], top_k: int) -> list[dict]:
     if not chunks:
         return chunks
     texts = [c["content"] for c in chunks]
-    result = voyage.rerank(query=question, documents=texts, model="rerank-2", top_k=RERANK_TOP_K)
+    result = voyage.rerank(query=question, documents=texts, model="rerank-2", top_k=top_k)
     return [chunks[r.index] for r in result.results]
 
 
-def build_prompt(question: str, chunks: list[dict], history: list[dict]) -> str:
-    excerpts = "\n\n".join(
-        f"[{i+1}] Report: \"{c['title']}\" | Page {c['page']}\n{c['content']}"
-        for i, c in enumerate(chunks)
-    )
-    history_text = ""
-    if history:
-        history_text = "\n\nConversation so far:\n" + "\n".join(
-            f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content']}"
-            for m in history[-6:]
-        )
-
-    return f"""You are an expert analyst on Nissan customer experience research. Your role is to synthesise findings from internal CX research reports and present them clearly to a non-technical business audience.
-
-INSTRUCTIONS:
-1. Answer using ONLY the provided report excerpts. Do not invent or infer facts not present in them.
-2. Cite every claim with the excerpt number in square brackets, e.g. [1] or [2][3]. Never make an uncited claim.
-3. Structure your answer as:
-   - **TL;DR** (2–3 sentences maximum): the single most important finding.
-   - **Detail**: supporting points, grouped by theme, market, or brand where relevant.
-4. When excerpts cover multiple markets or Nissan/Infiniti brands, distinguish them explicitly (e.g. "In the UK… [2]", "For Infiniti… [5]").
-5. If excerpts contradict each other, flag the contradiction: "Reports differ: [3] states X while [7] states Y."
-6. Preserve quantitative data exactly as stated (percentages, scores, sample sizes). Do not round or paraphrase numbers.
-7. If the excerpts do not contain enough information to answer fully, state clearly what is and is not covered, and suggest what kind of report might contain the missing data.
-{history_text}
-
-Report excerpts:
-{excerpts}
-
-Question: {question}"""
-
-
 def call_gemini(model: str, prompt: str) -> str:
-    """Call Gemini once with retry on transient errors. Raises on quota exhaustion."""
+    """Call Gemini with retry on transient errors. Raises on 429."""
     for attempt in range(4):
         try:
             response = gemini.models.generate_content(
@@ -145,7 +138,6 @@ def call_gemini(model: str, prompt: str) -> str:
             )
             return response.text
         except genai_errors.ClientError as e:
-            # 429 = quota exhausted → don't retry, let caller fall back
             if getattr(e, "status_code", None) == 429:
                 raise
             if attempt == 3:
@@ -158,28 +150,178 @@ def call_gemini(model: str, prompt: str) -> str:
     raise RuntimeError("Unreachable")
 
 
-def ask(question: str, history: list[dict]) -> tuple[str, list[dict], str]:
-    """Returns (answer, chunks, model_used)."""
-    query_vec = embed_query(question)
-    chunks    = retrieve(query_vec, question)
-    chunks    = rerank_chunks(question, chunks)
-    prompt    = build_prompt(question, chunks, history)
-
-    # Try primary, fall back to lite on quota exhaustion
+def _call_with_fallback(prompt: str) -> tuple[str, str]:
+    """Try primary model, fall back to lite on 429. Returns (answer, model_used)."""
     try:
         answer = call_gemini(PRIMARY_MODEL, prompt)
         record_use(PRIMARY_MODEL)
-        return answer, chunks, PRIMARY_MODEL
+        return answer, PRIMARY_MODEL
     except genai_errors.ClientError as e:
         if getattr(e, "status_code", None) != 429:
             raise
-        # Primary quota exhausted — try fallback
         answer = call_gemini(FALLBACK_MODEL, prompt)
         record_use(FALLBACK_MODEL)
-        return answer, chunks, FALLBACK_MODEL
+        return answer, FALLBACK_MODEL
 
 
-# ── UI ─────────────────────────────────────────────────────────────────────────
+def build_internal_prompt(question: str, chunks: list[dict], history: list[dict]) -> str:
+    excerpts = "\n\n".join(
+        f"[{i+1}] Report: \"{c['title']}\" | Page {c['page']}\n{c['content']}"
+        for i, c in enumerate(chunks)
+    )
+    return f"""You are an expert analyst on Nissan customer experience research. Your role is to synthesise findings from internal CX research reports and present them clearly to a non-technical business audience.
+
+INSTRUCTIONS:
+1. Answer using ONLY the provided report excerpts. Do not invent or infer facts not present in them.
+2. Cite every claim with the excerpt number in square brackets, e.g. [1] or [2][3]. Never make an uncited claim.
+3. Structure your answer as:
+   - **TL;DR** (2–3 sentences maximum): the single most important finding.
+   - **Detail**: supporting points, grouped by theme, market, or brand where relevant.
+4. When excerpts cover multiple markets or Nissan/Infiniti brands, distinguish them explicitly (e.g. "In the UK… [2]", "For Infiniti… [5]").
+5. If excerpts contradict each other, flag the contradiction: "Reports differ: [3] states X while [7] states Y."
+6. Preserve quantitative data exactly as stated (percentages, scores, sample sizes). Do not round or paraphrase numbers.
+7. If the excerpts do not contain enough information to answer fully, state clearly what is and is not covered, and suggest what kind of report might contain the missing data.
+{_format_history(history)}
+
+Report excerpts:
+{excerpts}
+
+Question: {question}"""
+
+
+def build_web_prompt(question: str, chunks: list[dict], history: list[dict]) -> str:
+    excerpts = "\n\n".join(
+        f"[w{i+1}] {_domain(c['source_url'])} | \"{c['title']}\"\n{c['content']}"
+        for i, c in enumerate(chunks)
+    )
+    return f"""You are answering a question using only public web sources retrieved for this query.
+
+INSTRUCTIONS:
+1. Answer using ONLY the provided web excerpts. Do not invent or infer facts not present in them.
+2. Cite every claim with the source number in square brackets, e.g. [w1] or [w2][w3]. Never make an uncited claim.
+3. Structure your answer as:
+   - **TL;DR** (2–3 sentences maximum): the single most important finding.
+   - **Detail**: supporting points grouped by theme or source.
+4. Preserve quantitative data exactly as stated. Do not round or paraphrase numbers.
+5. If sources contradict each other, flag it: "Sources differ: [w1] states X while [w3] states Y."
+6. If the web excerpts do not contain enough information to answer, say so clearly.
+{_format_history(history)}
+
+Web excerpts:
+{excerpts}
+
+Question: {question}"""
+
+
+# ── Ask functions ────────────────────────────────────────────────────────────────
+
+def ask_internal(question: str, history: list[dict]) -> tuple[str, list[dict], str, str | None]:
+    """Returns (answer, chunks, model_used, suggested_followup)."""
+    query_vec = embed_query(question)
+    chunks    = retrieve(query_vec, question)
+    chunks    = rerank_chunks(question, chunks, top_k=RERANK_TOP_K)
+    prompt    = build_internal_prompt(question, chunks, history)
+    answer, model_used = _call_with_fallback(prompt)
+    suggestion = suggest_followup(question, answer, history) if TAVILY_ENABLED else None
+    return answer, chunks, model_used, suggestion
+
+
+def suggest_followup(question: str, internal_answer: str, history: list[dict]) -> str | None:
+    """Generate a web follow-up suggestion using Gemini Flash Lite. Returns None if not useful."""
+    prompt = f"""You are helping a Nissan CX researcher decide whether the open web could extend an internal-research answer.
+
+Original question: {question}
+Internal answer (summary): {internal_answer[:600]}
+{_format_history(history[-4:])}
+
+Write ONE follow-up question (max 20 words) the user could ask the open web to fill a gap or add external industry context, while staying anchored on their original intent. Phrase it as a natural question.
+If the internal answer is already comprehensive and no useful web extension exists, return exactly: NONE
+
+Follow-up question:"""
+    try:
+        text = call_gemini(FALLBACK_MODEL, prompt).strip().strip('"\'').lstrip("- ").strip()
+        record_use(FALLBACK_MODEL)
+        return None if text.upper().startswith("NONE") else text or None
+    except Exception:
+        return None
+
+
+def ask_web(query: str, history: list[dict]) -> tuple[str, list[dict], str]:
+    """Search Tavily, rerank, answer via Gemini. Returns (answer, web_chunks, model_used)."""
+    if not TAVILY_ENABLED:
+        return "Web search is not configured. Add TAVILY_API_KEY to .env to enable it.", [], FALLBACK_MODEL
+
+    try:
+        resp = tavily.search(query, search_depth="basic", max_results=WEB_K, include_answer=False)
+        results = resp.get("results", [])
+    except Exception as e:
+        return f"Web search failed: {e}", [], FALLBACK_MODEL
+
+    if not results:
+        return "The web search returned no results for that query.", [], FALLBACK_MODEL
+
+    web_chunks = [
+        {
+            "source_id":   f"web:{r['url']}",
+            "source_url":  r["url"],
+            "title":       r.get("title", _domain(r["url"])),
+            "page":        None,
+            "chunk_index": 0,
+            "content":     r.get("content", ""),
+            "similarity":  None,
+            "is_external": True,
+        }
+        for r in results
+    ]
+    web_chunks = rerank_chunks(query, web_chunks, top_k=WEB_RERANK_TOP_K)
+    prompt = build_web_prompt(query, web_chunks, history)
+    answer, model_used = _call_with_fallback(prompt)
+    return answer, web_chunks, model_used
+
+
+# ── UI helpers ───────────────────────────────────────────────────────────────────
+
+def _render_source_cards(chunks: list[dict], is_web: bool = False) -> None:
+    if not chunks:
+        return
+    st.divider()
+    st.caption("**Sources retrieved**")
+    cols = st.columns(3)
+    for i, chunk in enumerate(chunks):
+        with cols[i % 3]:
+            if is_web:
+                domain = _domain(chunk["source_url"])
+                st.markdown(
+                    f"**[w{i+1}]** [{domain}]({chunk['source_url']})  \n"
+                    f"_{chunk['title'][:55]}_"
+                )
+            else:
+                page_url = f"{chunk['source_url']}#page={chunk['page']}"
+                sim = chunk.get("similarity")
+                sim_str = f" · {sim:.2f}" if sim is not None else ""
+                st.markdown(
+                    f"**[{i+1}]** [{chunk['title'][:45]}]({page_url})  \n"
+                    f"Page {chunk['page']}{sim_str}"
+                )
+
+
+def _render_followup_block(suggestion: str | None, btn_key: str) -> None:
+    """Render the suggested web follow-up below an internal answer."""
+    if not TAVILY_ENABLED:
+        return
+    st.divider()
+    if suggestion:
+        st.caption("**Extend with a web search** — suggested follow-up:")
+        st.markdown(f"> {suggestion}")
+        if st.button("→ copy to search", key=btn_key):
+            st.session_state.pending_input = suggestion
+            st.session_state.mode = "Web"
+            st.rerun()
+    else:
+        st.caption("**Extend with a web search** — switch to Web mode below and ask a follow-up.")
+
+
+# ── Page config & auth ───────────────────────────────────────────────────────────
 
 st.set_page_config(
     page_title="Nissan Insight RAG",
@@ -187,11 +329,8 @@ st.set_page_config(
     layout="wide",
 )
 
-# Password gate
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
-
-if "authenticated" not in st.session_state:
-    st.session_state.authenticated = False
+st.session_state.setdefault("authenticated", False)
 
 if not st.session_state.authenticated:
     st.title("Nissan Insight RAG")
@@ -207,61 +346,140 @@ if not st.session_state.authenticated:
 st.title("Nissan Insight RAG")
 st.caption("Ask questions across 121 Nissan customer experience research reports.")
 
-# Sidebar
+# ── Sidebar ──────────────────────────────────────────────────────────────────────
+
 with st.sidebar:
     st.header("About")
     st.markdown(
         "**Reports:** 121 PDFs (June 2023 – Nov 2025)  \n"
         "**Chunks:** 3,298  \n"
     )
-
     st.divider()
     if st.button("Clear conversation"):
-        st.session_state.messages = []
-        st.session_state.last_chunks = []
+        st.session_state.messages   = []
+        st.session_state.mode       = "Reports"
+        st.session_state.pending_input = ""
+        st.session_state.chat_text  = ""
         st.rerun()
 
-# Session state
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "last_chunks" not in st.session_state:
-    st.session_state.last_chunks = []
+# ── Session state defaults ───────────────────────────────────────────────────────
 
-# Render chat history
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
+st.session_state.setdefault("messages",       [])
+st.session_state.setdefault("mode",           "Reports")
+st.session_state.setdefault("pending_input",  "")
 
-# Chat input
-if question := st.chat_input("Ask a question about the Nissan research reports…"):
-    st.session_state.messages.append({"role": "user", "content": question})
-    with st.chat_message("user"):
-        st.markdown(question)
 
-    with st.chat_message("assistant"):
-        with st.spinner("Searching reports…"):
-            try:
-                answer, chunks, model_used = ask(question, st.session_state.messages[:-1])
-                st.session_state.last_chunks = chunks
-            except genai_errors.ClientError as e:
-                if getattr(e, "status_code", None) == 429:
-                    st.error("Both daily quotas are exhausted. Try again after midnight UTC.")
-                    st.stop()
-                raise
+# ── Apply pending "copy to search" pre-fill ──────────────────────────────────────
 
-        st.markdown(answer)
-        st.caption(f"_Answered with **{model_used}**_")
+if st.session_state.pending_input:
+    st.session_state.chat_text    = st.session_state.pending_input
+    st.session_state.pending_input = ""
 
-        if chunks:
-            st.divider()
-            st.caption("**Sources retrieved**")
-            cols = st.columns(3)
-            for i, chunk in enumerate(chunks):
-                with cols[i % 3]:
-                    page_url = f"{chunk['source_url']}#page={chunk['page']}"
-                    st.markdown(
-                        f"**[{i+1}]** [{chunk['title'][:45]}]({page_url})  \n"
-                        f"Page {chunk['page']} · similarity {chunk['similarity']:.2f}"
+
+# ── Render chat history ──────────────────────────────────────────────────────────
+
+for idx, msg in enumerate(st.session_state.messages):
+    kind = msg.get("kind", "user_internal" if msg["role"] == "user" else "assistant_internal")
+
+    if msg["role"] == "user":
+        with st.chat_message("user"):
+            prefix = "🌐 " if kind == "user_web" else ""
+            st.markdown(f"{prefix}{msg['content']}")
+    else:
+        with st.chat_message("assistant"):
+            st.markdown(msg["content"])
+            model_label = msg.get("model", "")
+            web_label   = "  · Web sources" if kind == "assistant_web" else ""
+            if model_label:
+                st.caption(f"_Answered with **{model_label}**{web_label}_")
+            _render_source_cards(msg.get("chunks", []), is_web=(kind == "assistant_web"))
+            if kind == "assistant_internal":
+                _render_followup_block(msg.get("suggestion"), btn_key=f"cp_{idx}")
+
+
+# ── Bottom bar ───────────────────────────────────────────────────────────────────
+
+col_input, col_mode, col_send = st.columns([6, 1, 1])
+
+with col_input:
+    chat_text = st.text_area(
+        "message",
+        key="chat_text",
+        label_visibility="collapsed",
+        placeholder="Ask a question about the Nissan research reports…",
+        height=80,
+    )
+
+with col_mode:
+    mode_options = ["Reports", "Web"] if TAVILY_ENABLED else ["Reports"]
+    mode = st.selectbox("Mode", mode_options, key="mode", label_visibility="collapsed")
+
+with col_send:
+    st.markdown("<div style='margin-top:1.85rem'></div>", unsafe_allow_html=True)
+    send = st.button("Send", use_container_width=True)
+
+if not TAVILY_ENABLED:
+    st.caption("ℹ️ Add `TAVILY_API_KEY` to `.env` or Streamlit secrets to enable Web search.")
+
+
+# ── Handle send ──────────────────────────────────────────────────────────────────
+
+if send and chat_text and chat_text.strip():
+    question = chat_text.strip()
+    st.session_state.chat_text = ""   # clear input for next render
+
+    if mode == "Web":
+        st.session_state.messages.append({"role": "user", "kind": "user_web", "content": question})
+        with st.chat_message("user"):
+            st.markdown(f"🌐 {question}")
+
+        with st.chat_message("assistant"):
+            with st.spinner("Searching the web…"):
+                try:
+                    answer, web_chunks, model_used = ask_web(
+                        question, st.session_state.messages[:-1]
                     )
+                except genai_errors.ClientError as e:
+                    if getattr(e, "status_code", None) == 429:
+                        st.error("Both daily quotas are exhausted. Try again after midnight UTC.")
+                        st.stop()
+                    raise
+            st.markdown(answer)
+            st.caption(f"_Answered with **{model_used}**  · Web sources_")
+            _render_source_cards(web_chunks, is_web=True)
 
-    st.session_state.messages.append({"role": "assistant", "content": answer})
+        st.session_state.messages.append({
+            "role": "assistant", "kind": "assistant_web",
+            "content": answer, "model": model_used,
+            "chunks": web_chunks, "suggestion": None,
+        })
+        st.session_state.mode = "Reports"   # auto-revert
+
+    else:
+        st.session_state.messages.append({"role": "user", "kind": "user_internal", "content": question})
+        with st.chat_message("user"):
+            st.markdown(question)
+
+        with st.chat_message("assistant"):
+            with st.spinner("Searching reports…"):
+                try:
+                    answer, chunks, model_used, suggestion = ask_internal(
+                        question, st.session_state.messages[:-1]
+                    )
+                except genai_errors.ClientError as e:
+                    if getattr(e, "status_code", None) == 429:
+                        st.error("Both daily quotas are exhausted. Try again after midnight UTC.")
+                        st.stop()
+                    raise
+            st.markdown(answer)
+            st.caption(f"_Answered with **{model_used}**_")
+            _render_source_cards(chunks, is_web=False)
+            _render_followup_block(suggestion, btn_key=f"cp_new_{len(st.session_state.messages)}")
+
+        st.session_state.messages.append({
+            "role": "assistant", "kind": "assistant_internal",
+            "content": answer, "model": model_used,
+            "chunks": chunks, "suggestion": suggestion,
+        })
+
+    st.rerun()
