@@ -213,27 +213,7 @@ with st.sidebar:
     st.markdown(
         "**Reports:** 121 PDFs (June 2023 – Nov 2025)  \n"
         "**Chunks:** 3,298  \n"
-        f"**LLM:** {PRIMARY_MODEL} → {FALLBACK_MODEL}  \n"
     )
-
-    st.divider()
-    st.markdown("**Daily quota** _(resets at midnight UTC)_")
-
-    primary_left  = remaining(PRIMARY_MODEL, PRIMARY_RPD)
-    fallback_left = remaining(FALLBACK_MODEL, FALLBACK_RPD)
-
-    p_pct = primary_left / PRIMARY_RPD
-    p_color = "🟢" if p_pct > 0.5 else "🟡" if p_pct > 0.2 else "🔴"
-    st.markdown(f"{p_color} **{PRIMARY_MODEL}**  \n{primary_left} / {PRIMARY_RPD} remaining")
-
-    f_pct = fallback_left / FALLBACK_RPD
-    f_color = "🟢" if f_pct > 0.5 else "🟡" if f_pct > 0.2 else "🔴"
-    st.markdown(f"{f_color} **{FALLBACK_MODEL}**  \n{fallback_left} / {FALLBACK_RPD} remaining")
-
-    if primary_left == 0 and fallback_left == 0:
-        st.error("Daily quota exhausted on both models. Resets at midnight UTC.")
-    elif primary_left == 0:
-        st.info(f"Primary model exhausted — using {FALLBACK_MODEL} until midnight UTC.")
 
     st.divider()
     if st.button("Clear conversation"):
