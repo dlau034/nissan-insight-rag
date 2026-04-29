@@ -50,6 +50,7 @@ FALLBACK_MODEL = "gemini-3.1-flash-lite-preview"
 USAGE_FILE = Path("data/usage.json")
 REPORTS_MODE = "CE Reports"
 WEB_MODE = "Web"
+APP_VERSION = "v1.1.0"
 
 
 # ── Clients ─────────────────────────────────────────────────────────────────────
@@ -398,6 +399,7 @@ st.session_state.setdefault("authenticated", False)
 
 if not st.session_state.authenticated:
     st.title("Nissan Insight RAG")
+    st.caption(APP_VERSION)
     pwd = st.text_input("Password", type="password")
     if st.button("Enter"):
         if pwd == APP_PASSWORD:
@@ -408,12 +410,13 @@ if not st.session_state.authenticated:
     st.stop()
 
 st.title("Nissan Insight RAG")
-st.caption("Ask questions across 121 Nissan customer experience research reports.")
+st.caption(f"{APP_VERSION} · Ask questions across 121 Nissan customer experience research reports.")
 
 # ── Sidebar ──────────────────────────────────────────────────────────────────────
 
 with st.sidebar:
     st.header("About")
+    st.caption(APP_VERSION)
     st.markdown(
         "**Reports:** 121 PDFs (June 2023 – Nov 2025)  \n"
         "**Chunks:** 3,298  \n"

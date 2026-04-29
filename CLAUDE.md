@@ -28,7 +28,8 @@ local extra_pdfs/ folder     ──┘
 - **Embeddings:** Voyage AI `voyage-3` (1024 dims). Same model used at ingest and query time.
 - **LLM:** Gemini 3 Flash Preview (primary) → Gemini 3.1 Flash Lite Preview (fallback). Daily-quota auto-fallback.
 - **Vector store:** Supabase pgvector (project `mukczuwgyebdimvtcjuq`, eu-west-1).
-- **Frontend:** Streamlit chat with citation cards linking back to original PDFs.
+- **Frontend:** Streamlit chat with citation cards linking back to original PDFs,
+  source labels for CE reports vs Web search, and visible app versioning.
 
 ## Repo layout
 
@@ -67,11 +68,22 @@ Document Source/            # NOT committed (sample PDF reference)
 
 - **Query (`app.py`):**
   - Embed question with Voyage (`input_type="query"`).
-  - `match_insights(query_embedding, match_count=12)` RPC in Supabase returns top-12
-    by cosine similarity.
+  - `hybrid_match_insights(query_embedding, query_text, match_count=30)` RPC in Supabase
+    returns hybrid candidates.
+  - Voyage `rerank-2` reranks candidates to the internal top-12.
   - Build prompt: system instructions + numbered excerpts + history + question.
   - Call primary Gemini model. On 429, automatically retry on fallback model.
   - Render answer with numbered citation cards linking to `{source_url}#page={N}`.
+  - Optional Web mode uses Tavily search, reranks web snippets, and answers with web-only
+    citations. `TAVILY_API_KEY` can be provided from `.env` locally or Streamlit secrets
+    in Community Cloud.
+
+- **UI/versioning (`app.py`):**
+  - `APP_VERSION` is the single visible version constant. It appears on the login screen,
+    main title caption, and sidebar About panel.
+  - The Streamlit sidebar is styled to 200px on desktop and hidden on mobile.
+  - The bottom composer is fixed, aligned to the sidebar on desktop, stacked on mobile,
+    and reserves space for Streamlit Cloud's floating app controls.
 
 ## Supabase
 
