@@ -313,7 +313,7 @@ def _render_followup_block(suggestion: str | None, btn_key: str) -> None:
     if suggestion:
         st.caption("**Extend with a web search** — suggested follow-up:")
         st.markdown(f"> {suggestion}")
-        if st.button("→ copy to search", key=btn_key):
+        if st.button("Copy to chat", key=btn_key):
             st.session_state.pending_input = suggestion
             st.session_state.mode = "Web"
             st.rerun()
@@ -391,8 +391,35 @@ for idx, msg in enumerate(st.session_state.messages):
 
 
 # ── Bottom bar ───────────────────────────────────────────────────────────────────
-# Use st.form so the input clears automatically on submit (clear_on_submit=True),
-# and pre-fill via value= so we never write to a widget key after it's rendered.
+
+# Fixed-bottom CSS: pin the form to the viewport bottom, pad the content area
+# so messages are never hidden behind it, and strip the form's default border.
+st.markdown("""
+<style>
+/* Pad content so last message isn't hidden behind the fixed bar */
+.main .block-container {
+    padding-bottom: 90px !important;
+}
+/* Fix the form to the bottom of the viewport */
+div[data-testid="stForm"] {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    z-index: 999;
+    background-color: white;
+    padding: 0.55rem 2rem 0.65rem;
+    border-top: 1px solid rgba(49, 51, 63, 0.2);
+    box-shadow: 0 -2px 8px rgba(0, 0, 0, 0.05);
+}
+/* Remove the default form box/border inside the fixed bar */
+div[data-testid="stForm"] > div:first-child {
+    border: none !important;
+    box-shadow: none !important;
+    padding: 0 !important;
+}
+</style>
+""", unsafe_allow_html=True)
 
 mode_options = ["Reports", "Web"] if TAVILY_ENABLED else ["Reports"]
 pending      = st.session_state.get("pending_input", "")
@@ -400,22 +427,20 @@ current_mode = st.session_state.get("mode", "Reports")
 mode_idx     = mode_options.index(current_mode) if current_mode in mode_options else 0
 
 with st.form(f"chat_form_{st.session_state.form_counter}", clear_on_submit=False):
-    col_input, col_mode, col_send = st.columns([6, 1, 1])
+    col_input, col_mode, col_send = st.columns([7, 1.2, 0.5])
     with col_input:
-        chat_text = st.text_area(
+        chat_text = st.text_input(
             "message",
             value=pending,
             label_visibility="collapsed",
-            placeholder="Ask a question about the Nissan research reports…",
-            height=80,
+            placeholder="Ask a question about the CE reports…",
         )
     with col_mode:
         mode = st.selectbox(
             "Mode", mode_options, index=mode_idx, label_visibility="collapsed"
         )
     with col_send:
-        st.markdown("<div style='margin-top:1.85rem'></div>", unsafe_allow_html=True)
-        send = st.form_submit_button("Send", use_container_width=True)
+        send = st.form_submit_button("↵", use_container_width=True)
 
 # Consume the pending input now that the form has rendered it
 st.session_state.pending_input = ""
