@@ -6,6 +6,7 @@ Run with: streamlit run app.py
 
 import os, time, json
 from datetime import datetime, timezone
+from html import escape
 from pathlib import Path
 from urllib.parse import urlparse
 from dotenv import load_dotenv
@@ -39,6 +40,8 @@ PRIMARY_MODEL  = "gemini-3-flash-preview"
 FALLBACK_MODEL = "gemini-3.1-flash-lite-preview"
 
 USAGE_FILE = Path("data/usage.json")
+REPORTS_MODE = "CE Reports"
+WEB_MODE = "Web"
 
 
 # ── Clients ─────────────────────────────────────────────────────────────────────
@@ -103,6 +106,22 @@ def _format_history(history: list[dict]) -> str:
               " (web answer)" if m.get("kind") == "assistant_web" else ""
         lines.append(f"{role}{tag}: {m['content']}")
     return "\n\nConversation so far:\n" + "\n".join(lines)
+
+
+def _clean_followup_text(text: str) -> str:
+    """Remove assistant-style labels before pre-filling the chat box."""
+    cleaned = text.strip().strip('"\'').lstrip("- ").strip()
+    prefix = "Follow-up question:"
+    if cleaned.lower().startswith(prefix.lower()):
+        cleaned = cleaned[len(prefix):].strip()
+    return cleaned
+
+
+def _prefill_chat(text: str, mode: str) -> None:
+    """Queue text for the composer and force Streamlit to rebuild its widgets."""
+    st.session_state.pending_input = _clean_followup_text(text)
+    st.session_state.mode = mode
+    st.session_state.form_counter = st.session_state.get("form_counter", 0) + 1
 
 
 # ── RAG core ─────────────────────────────────────────────────────────────────────
@@ -239,7 +258,7 @@ If the internal answer is already comprehensive and no useful web extension exis
 
 Follow-up question:"""
     try:
-        text = call_gemini(FALLBACK_MODEL, prompt).strip().strip('"\'').lstrip("- ").strip()
+        text = _clean_followup_text(call_gemini(FALLBACK_MODEL, prompt))
         record_use(FALLBACK_MODEL)
         return None if text.upper().startswith("NONE") else text or None
     except Exception:
@@ -305,17 +324,53 @@ def _render_source_cards(chunks: list[dict], is_web: bool = False) -> None:
                 )
 
 
+def _render_origin_label(is_web: bool) -> None:
+    label = "Generated from Web search" if is_web else "Generated from CE reports"
+    bg = "#111827" if is_web else "#F3F4F6"
+    fg = "#FFFFFF" if is_web else "#111827"
+    st.markdown(
+        f"""
+        <div style="margin: 0.15rem 0 0.65rem;">
+            <span style="
+                display: inline-flex;
+                align-items: center;
+                border-radius: 999px;
+                background: {bg};
+                color: {fg};
+                font-size: 0.8rem;
+                font-weight: 700;
+                line-height: 1;
+                padding: 0.4rem 0.65rem;
+            ">{label}</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def _render_followup_block(suggestion: str | None, btn_key: str) -> None:
     """Render the suggested web follow-up below an internal answer."""
     if not TAVILY_ENABLED:
         return
     st.divider()
     if suggestion:
-        st.caption("**Extend with a web search** — suggested follow-up:")
-        st.markdown(f"> {suggestion}")
+        st.markdown(
+            "**Would you like to extend your question with a web search based on this recommended follow up question?**"
+        )
+        st.markdown(
+            f"""
+            <div style="
+                margin: 0.35rem 0 0.65rem;
+                color: #111827;
+                font-size: 1rem;
+                font-weight: 650;
+                line-height: 1.45;
+            ">{escape(suggestion)}</div>
+            """,
+            unsafe_allow_html=True,
+        )
         if st.button("Copy to chat", key=btn_key):
-            st.session_state.pending_input = suggestion
-            st.session_state.mode = "Web"
+            _prefill_chat(suggestion, WEB_MODE)
             st.rerun()
     else:
         st.caption("**Extend with a web search** — switch to Web mode below and ask a follow-up.")
@@ -327,6 +382,7 @@ st.set_page_config(
     page_title="Nissan Insight RAG",
     page_icon="🚗",
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
@@ -357,14 +413,14 @@ with st.sidebar:
     st.divider()
     if st.button("Clear conversation"):
         st.session_state.messages      = []
-        st.session_state.mode          = "Reports"
+        st.session_state.mode          = REPORTS_MODE
         st.session_state.pending_input = ""
         st.rerun()
 
 # ── Session state defaults ───────────────────────────────────────────────────────
 
 st.session_state.setdefault("messages",       [])
-st.session_state.setdefault("mode",           "Reports")
+st.session_state.setdefault("mode",           REPORTS_MODE)
 st.session_state.setdefault("pending_input",  "")
 st.session_state.setdefault("form_counter",   0)
 
@@ -381,6 +437,7 @@ for idx, msg in enumerate(st.session_state.messages):
     else:
         with st.chat_message("assistant"):
             st.markdown(msg["content"])
+            _render_origin_label(is_web=(kind == "assistant_web"))
             model_label = msg.get("model", "")
             web_label   = "  · Web sources" if kind == "assistant_web" else ""
             if model_label:
@@ -392,52 +449,131 @@ for idx, msg in enumerate(st.session_state.messages):
 
 # ── Bottom bar ───────────────────────────────────────────────────────────────────
 
-# Fixed-bottom CSS: pin the form to the viewport bottom, pad the content area
-# so messages are never hidden behind it, and strip the form's default border.
+# Keep the chat composer pinned while explicitly constraining its height. Without
+# the height resets, Streamlit's internal form wrapper can cover the main page.
 st.markdown("""
 <style>
-/* Pad content so last message isn't hidden behind the fixed bar */
-.main .block-container {
-    padding-bottom: 90px !important;
+:root {
+    --sidebar-width: 200px;
+    --composer-height: 88px;
 }
-/* Fix the form to the bottom of the viewport */
+section[data-testid="stSidebar"] {
+    width: var(--sidebar-width) !important;
+    min-width: var(--sidebar-width) !important;
+    max-width: var(--sidebar-width) !important;
+}
+section[data-testid="stSidebar"] > div {
+    width: var(--sidebar-width) !important;
+    min-width: var(--sidebar-width) !important;
+    max-width: var(--sidebar-width) !important;
+}
+button[aria-label="Open sidebar"],
+button[aria-label="Close sidebar"],
+button[data-testid="stSidebarCollapseButton"],
+button[data-testid="stSidebarCollapsedControl"],
+div[data-testid="stSidebarCollapsedControl"],
+div[data-testid="collapsedControl"] {
+    display: none !important;
+}
+.main .block-container {
+    padding-bottom: 104px !important;
+}
 div[data-testid="stForm"] {
-    position: fixed;
-    bottom: 0;
-    left: 0;
-    right: 0;
-    z-index: 999;
+    position: fixed !important;
+    right: 0 !important;
+    bottom: 0 !important;
+    left: var(--sidebar-width) !important;
+    width: auto !important;
+    max-width: none !important;
+    min-width: 0 !important;
+    z-index: 999 !important;
+    height: auto !important;
+    min-height: 0 !important;
+    max-height: 88px !important;
+    overflow: visible !important;
+    box-sizing: border-box !important;
     background-color: white;
-    padding: 0.55rem 2rem 0.65rem;
+    padding: 0.55rem 1rem 0.65rem;
     border-top: 1px solid rgba(49, 51, 63, 0.2);
     box-shadow: 0 -2px 8px rgba(0, 0, 0, 0.05);
 }
-/* Remove the default form box/border inside the fixed bar */
 div[data-testid="stForm"] > div:first-child {
+    height: auto !important;
+    min-height: 0 !important;
     border: none !important;
     box-shadow: none !important;
     padding: 0 !important;
 }
+div[data-testid="stForm"] div[data-testid="stVerticalBlock"] {
+    height: auto !important;
+    min-height: 0 !important;
+}
+div[data-testid="stForm"] div[data-testid="stFormSubmitButton"] button {
+    background-color: #111827 !important;
+    border-color: #111827 !important;
+    color: white !important;
+}
+div[data-testid="stForm"] div[data-testid="stFormSubmitButton"] button:hover {
+    background-color: #000000 !important;
+    border-color: #000000 !important;
+    color: white !important;
+}
+div[data-testid="stForm"] div[data-testid="stFormSubmitButton"] button p {
+    color: inherit !important;
+}
+@media (max-width: 900px) {
+    section[data-testid="stSidebar"] {
+        display: none !important;
+    }
+    .main .block-container {
+        padding-bottom: 220px !important;
+    }
+    div[data-testid="stForm"] {
+        left: 0 !important;
+        width: auto !important;
+        max-width: none !important;
+        max-height: 210px !important;
+        padding-left: 1rem;
+        padding-right: 1rem;
+    }
+    div[data-testid="stForm"] div[data-testid="stHorizontalBlock"] {
+        flex-direction: column !important;
+        gap: 0.55rem !important;
+    }
+    div[data-testid="stForm"] div[data-testid="stColumn"] {
+        width: 100% !important;
+        flex: 1 1 auto !important;
+    }
+}
 </style>
 """, unsafe_allow_html=True)
 
-mode_options = ["Reports", "Web"] if TAVILY_ENABLED else ["Reports"]
+mode_options = [REPORTS_MODE, WEB_MODE] if TAVILY_ENABLED else [REPORTS_MODE]
 pending      = st.session_state.get("pending_input", "")
-current_mode = st.session_state.get("mode", "Reports")
+current_mode = st.session_state.get("mode", REPORTS_MODE)
+if current_mode == "Reports":
+    current_mode = REPORTS_MODE
+    st.session_state.mode = REPORTS_MODE
 mode_idx     = mode_options.index(current_mode) if current_mode in mode_options else 0
 
 with st.form(f"chat_form_{st.session_state.form_counter}", clear_on_submit=False):
-    col_input, col_mode, col_send = st.columns([7, 1.2, 0.5])
+    form_id = st.session_state.form_counter
+    col_input, col_mode, col_send = st.columns([4.8, 1.6, 0.8])
     with col_input:
         chat_text = st.text_input(
             "message",
             value=pending,
+            key=f"chat_text_{form_id}",
             label_visibility="collapsed",
             placeholder="Ask a question about the CE reports…",
         )
     with col_mode:
         mode = st.selectbox(
-            "Mode", mode_options, index=mode_idx, label_visibility="collapsed"
+            "Mode",
+            mode_options,
+            index=mode_idx,
+            key=f"chat_mode_{form_id}",
+            label_visibility="collapsed",
         )
     with col_send:
         send = st.form_submit_button("↵", use_container_width=True)
@@ -456,7 +592,7 @@ if send and chat_text and chat_text.strip():
     st.session_state.mode = mode
     st.session_state.form_counter += 1  # cycle form key → fresh empty form on next render
 
-    if mode == "Web":
+    if mode == WEB_MODE:
         st.session_state.messages.append({"role": "user", "kind": "user_web", "content": question})
         with st.chat_message("user"):
             st.markdown(f"🌐 {question}")
@@ -473,6 +609,7 @@ if send and chat_text and chat_text.strip():
                         st.stop()
                     raise
             st.markdown(answer)
+            _render_origin_label(is_web=True)
             st.caption(f"_Answered with **{model_used}**  · Web sources_")
             _render_source_cards(web_chunks, is_web=True)
 
@@ -481,7 +618,7 @@ if send and chat_text and chat_text.strip():
             "content": answer, "model": model_used,
             "chunks": web_chunks, "suggestion": None,
         })
-        st.session_state.mode = "Reports"   # auto-revert
+        st.session_state.mode = REPORTS_MODE   # auto-revert
 
     else:
         st.session_state.messages.append({"role": "user", "kind": "user_internal", "content": question})
@@ -500,6 +637,7 @@ if send and chat_text and chat_text.strip():
                         st.stop()
                     raise
             st.markdown(answer)
+            _render_origin_label(is_web=False)
             st.caption(f"_Answered with **{model_used}**_")
             _render_source_cards(chunks, is_web=False)
             _render_followup_block(suggestion, btn_key=f"cp_new_{len(st.session_state.messages)}")
